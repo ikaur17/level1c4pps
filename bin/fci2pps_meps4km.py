@@ -1,0 +1,94 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright (c) 2019 level1c4pps developers
+#
+# This file is part of level1c4pps
+#
+# level1c4pps is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# level1c4pps is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with level1c4pps.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Script to convert FCI level-1 to PPS level-1c format using Pytroll/Satpy."""
+
+import argparse
+from level1c4pps.fci2pps_meps4km_lib import process_one_scene
+
+msg_grids = [
+    "msg_seviri_fes_3km",
+    "msg_seviri_fes_1km",
+    "msg_seviri_rss_3km",
+    "msg_seviri_rss_1km",
+    "msg_seviri_iodc_3km",
+    "msg_seviri_iodc_1km",
+]
+
+if __name__ == "__main__":
+    """ Create PPS-format level1c data
+    From a list of FCI remapped MEPS4km level-1 files create a NWCSAF/PPS formatet level1c file for pps.
+    """
+    parser = argparse.ArgumentParser(
+        description=("Script to produce a PPS-level1c file for a FCI level-1 scene")
+    )
+    parser.add_argument(
+        "files",
+        metavar="fileN",
+        type=str,
+        nargs="+",
+        help="List of FCI files to process",
+    )
+    parser.add_argument(
+        "-o",
+        "--out_dir",
+        type=str,
+        required=False,
+        default=".",
+        help="Output directory where to store the level1c file",
+    )
+    parser.add_argument(
+        "-ch",
+        "--channel_selection",
+        required=False,
+        default="default",
+        choices=["default", "all", "pps", "avhrr_heritage"],
+        help=(
+            "Channels to use. Choose from:"
+            "  default - Uses the standard channels,"
+            "  all - Uses all available channels,"
+            "  pps - Uses the channels required for PPS only, "
+            "  avhrr_heritage - Uses channels available on AVHRR."
+        ),
+    )
+    parser.add_argument(
+        "-ne",
+        "--nc_engine",
+        type=str,
+        required=False,
+        default="h5netcdf",
+        help="Engine for saving netcdf files netcdf4 or h5netcdf (default).",
+    )
+    parser.add_argument(
+        "-on",
+        "--orbit_number",
+        type=int,
+        required=False,
+        default=0,
+        help="Orbit number (default is 00000).",
+    )
+
+    options = parser.parse_args()
+    process_one_scene(
+        options.files,
+        options.out_dir,
+        engine=options.nc_engine,
+        channel_selection=options.channel_selection,
+        orbit_n=options.orbit_number,
+    )
