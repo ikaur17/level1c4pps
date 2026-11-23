@@ -1,0 +1,225 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright (c) 2019 level1c4pps developers
+#
+# This file is part of level1c4pps
+#
+# level1c4pps is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# level1c4pps is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with level1c4pps.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Functions to convert FCI level-1 data to a NWCSAF/PPS level-1c formatet netCDF/CF file."""
+
+import datetime as dt
+import logging
+import json
+import time
+
+import hdf5plugin  # testing that library for fci is available # noqa: F401
+import numpy as np
+import pytz  # testing that library for fci is available # noqa: F401
+import satpy
+from packaging.version import Version
+from pyorbital.astronomy import get_alt_az, sun_zenith_angle
+from satpy.scene import Scene
+
+from level1c4pps import (
+    check_file_exists,
+    compose_filename,
+    dt64_to_datetime,
+    fix_timestamp_datatype,
+    get_band_names,
+    get_header_attrs,
+    get_refl_bands,
+    log_time,
+    save_data,
+    set_header_and_band_attrs_defaults,
+)
+from level1c4pps.seviri2pps_lib import (
+    add_ancillary_datasets,
+    get_lonlats,
+    get_satellite_angles,
+    make_azidiff_angle,
+)
+# Example:
+# "fci_20260315_06_10.nc"
+
+logger = logging.getLogger("fci2pps")
+
+if Version(satpy.__version__) <= Version("0.59.0"):
+    if Version(satpy.__version__) > Version("0.56.0"):
+        logger.warning("Native resampling craching for satpy 0.57 to 0.59.0.")
+
+ANCILLARY_DATA_TO_LOAD = [
+    "longitude",
+    "latitude",
+    "sunzenith",
+    "sunazimuth",
+    "satzenith",
+    "satazimuth",
+]
+
+PPS_TAGS = {
+    "vis_06": "ch_r06",
+    "vis_08": "ch_r09",
+    "nir_13": "ch_r13",
+    "nir_16": "ch_r16",
+    "nir_22": "ch_r22",
+    "ir_38": "ch_tb37",
+    "ir_87": "ch_tb85",
+    "ir_105": "ch_tb11",
+    "ir_123": "ch_tb12",
+    # Not used yet:
+    "wv_63": "ch_tb67",
+    "wv_73": "ch_tb73",
+    "vis_05": "ch_rxx",
+    "vis_04": "ch_rxx",
+    "vis_09": "ch_rxx",
+}
+
+refl_bands = get_refl_bands(PPS_TAGS)
+ONE_IR_CHANNEL = "ir_105"
+
+
+def set_header_and_band_attrs(scene, orbit_n=00000):
+    """Set and delete some attributes."""
+    # Set some header attributes:
+    ir_channel_obj = scene[ONE_IR_CHANNEL]
+    scene.attrs["source"] = "fci2pps_meps2km.py"
+    scene.attrs["region_id"] = ir_channel_obj.attrs.get("area").area_id
+    scene.attrs["region_name"] = ir_channel_obj.attrs.get("area").name
+    # scene.attrs["area"] = dump_area_to_dict(ir_channel_obj.attrs.get("area"))
+    set_header_and_band_attrs_defaults(scene, PPS_TAGS, ir_channel_obj, orbit_n=orbit_n)
+    for band in refl_bands:
+        if band not in scene:
+            continue
+        if scene[band].attrs["sun_zenith_angle_correction_applied"] == "False":
+            logger.warning(
+                f"Setting sun_zenith_angle_correction_applied to True for band {band}"
+            )
+            scene[band].attrs["sun_zenith_angle_correction_applied"] = "True"
+
+
+def dump_area_to_dict(area):
+    """Dumps pyresample area defintion to a dict, later used as a header."""
+
+    return json.dumps(
+        {
+            "area_extent": [
+                float(v) for v in area.area_extent
+            ],  # [xmin, ymin, xmax, ymax]
+            "xsize": int(area.width),
+            "ysize": int(area.height),
+            "xscale": float(area.pixel_size_x),
+            "yscale": float(area.pixel_size_y),
+            "id": str(area.area_id),
+            "name": str(area.description),
+            "pcs_id": str(area.proj_id),
+            "pcs_def": pcs_def,
+        }
+    )
+
+
+def get_solar_angles(scene, lons, lats):
+    """Compute solar angles.
+
+    Compute angles for each scanline using their acquisition time to account for
+    the earth's rotation over the course of one scan.
+
+    Returns:
+        Solar azimuth angle, Solar zenith angle in degrees
+
+    """
+    # suna = np.full(lons.shape, np.nan)
+    # sun_zenith = np.full(lons.shape, np.nan)
+    # acq_time = scene.start_time
+    # _, suna = get_alt_az(acq_time, lons, lats)
+    # suna = np.rad2deg(suna)
+    # sun_zenith = sun_zenith_angle(acq_time, lons, lats)
+    sun_zenith = scene["sunzenith"]
+    sun_azimuth = scene["sunazimuth"]
+    return sun_azimuth, sun_zenith
+
+
+def fix_time(scene):
+    """Make datetime objects from time in seconds."""
+    if type(scene["ir_105_time"].values[0, 0]) is np.float64:
+        epoch_to_2000 = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc).timestamp()
+        scene["ir_105_time"] = (scene["ir_105_time"] + epoch_to_2000).astype(
+            "datetime64[s]"
+        )
+    ind = int(scene["ir_105_time"].shape[0] / 2)
+    a_time = dt64_to_datetime(scene["ir_105_time"].values[ind, ind])
+    if a_time > scene.end_time or a_time < scene.start_time:
+        raise ValueError(
+            f"There is someting wrong with the time variable, at {ind}, {ind}"
+        )
+    scene["ir_105_time"].attrs.pop("units", None)
+    scene["ir_105_time"].attrs.pop("_FillValue", None)
+
+
+def add_angles_and_latlon(scene):
+    """Add the lon/lat and angles datasets."""
+    # ir_channel_obj = scene[ONE_IR_CHANNEL]
+    # lons, lats = get_lonlats(ir_channel_obj)
+    # sun_azimuth, sun_zenith = get_solar_angles(scene, lons=lons, lats=lats)
+
+    lons = scene["longitude"].values
+    lats = scene["latitude"].values
+    sun_zenith = scene["sunzenith"].values
+    sun_azimuth = scene["sunazimuth"].values
+    sat_zenith = scene["satzenith"].values
+    sat_azimuth = scene["satazimuth"].values
+
+    # sat_azimuth, sat_zenith = get_satellite_angles(
+    #     scene[ONE_IR_CHANNEL], lons=lons, lats=lats
+    # )
+    azidiff = make_azidiff_angle(sat_azimuth, sun_azimuth)
+
+    add_ancillary_datasets(
+        scene,
+        lons=lons,
+        lats=lats,
+        sun_zenith=sun_zenith,
+        sat_zenith=sat_zenith,
+        azidiff=azidiff,
+        sun_azimuth=sun_azimuth,
+        sat_azimuth=sat_azimuth,
+        irch_name="ir_105",
+        save_azimuth_angles=False,
+        chunks=(464, 928),
+    )
+
+
+def process_one_scene(
+    scene_files,
+    out_path,
+    engine="h5netcdf",
+    channel_selection="default",
+    orbit_n=0,
+):
+    """Make level 1c files in PPS-format."""
+    tic = time.time()
+    check_file_exists(scene_files)
+    scene = Scene(reader="fci_l1c_meps2km", filenames=scene_files)
+    my_bands = get_band_names(PPS_TAGS, channel_selection)
+    bands_to_load = my_bands
+    print(bands_to_load, ANCILLARY_DATA_TO_LOAD)
+    scene.load(bands_to_load + ANCILLARY_DATA_TO_LOAD)
+    add_angles_and_latlon(scene)
+    ir_channel_obj = scene[ONE_IR_CHANNEL]
+    set_header_and_band_attrs(scene, orbit_n=orbit_n)
+    filename = compose_filename(scene, out_path, instrument="fci", band=ir_channel_obj)
+    header_attrs = get_header_attrs(scene, band=ir_channel_obj, sensor="fci")
+    save_data(scene, filename, header_attrs, engine)
+    log_time(filename, tic)
+    return filename
